@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # Web Framework
-axum = "0.7"
+axum = "0.8"
 
 # GraphQL
 async-graphql = { version = "7.0", features = ["uuid"] }
@@ -31,3 +31,9 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Cache, queue, and search services
+redis = { version = "0.27", features = ["tokio-comp"] }
+lapin = "2.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+url = "2"

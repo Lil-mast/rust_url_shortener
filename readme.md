@@ -1,47 +1,36 @@
 # Rust URL Shortener
 
-A small URL shortener API built with Rust, Axum, GraphQL, and PostgreSQL. It lets you create short codes for long URLs and look up the saved URL by its code.
+A Rust URL shortener built with Axum, GraphQL, PostgreSQL, Redis, RabbitMQ, and Elasticsearch. PostgreSQL is the durable source of truth; Redis accelerates redirects and RabbitMQ workers maintain the search index asynchronously.
 
-## Features
+## Local setup
 
-- Create a short URL with an optional custom code.
-- Generate a six-character code when no custom code is provided.
-- Look up a URL entry by its short code.
-- Persist URL entries in PostgreSQL.
-- Serve a GraphiQL interface and GraphQL API at `/`.
-- Run the database migration automatically when the server starts.
-
-## Requirements
-
-- Rust and Cargo (Rust 2021 edition).
-- A PostgreSQL database.
-
-## Configuration
-
-Set `DATABASE_URL` to a PostgreSQL connection string. `PORT` is optional and defaults to `8080`.
-
-For local development, create a `.env` file in the project root:
-
-```dotenv
-DATABASE_URL=postgres://username:password@localhost:5432/url_shortener
-PORT=8080
-```
-
-The server runs the migration in `migrations/` on startup, creating the `urls` table and its short-code index.
-
-## Run
+Requirements: Rust/Cargo and Docker Compose.
 
 ```sh
+docker compose up -d --wait
+cp .env.example .env
 cargo run
 ```
 
-Once running, open [http://localhost:8080/](http://localhost:8080/) to use GraphiQL. If you set a different `PORT`, use that port instead.
+The application applies SQLx migrations at startup. It listens on port `8080` by default. Open [http://localhost:8080/](http://localhost:8080/) for GraphiQL.
 
-## GraphQL API
+Environment variables:
 
-The API is available at `POST /`.
+| Name | Default | Purpose |
+| --- | --- | --- |
+| `DATABASE_URL` | required | PostgreSQL connection string |
+| `REDIS_URL` | `redis://127.0.0.1/` | Redis cache connection |
+| `RABBITMQ_URL` | `amqp://127.0.0.1:5672/%2f` | RabbitMQ connection |
+| `ELASTICSEARCH_URL` | `http://127.0.0.1:9200` | Elasticsearch endpoint |
+| `PORT` | `8080` | HTTP listen port |
+| `CACHE_ENABLED` | `true` | Set to `false` to benchmark database-only retrieval |
+| `DENIED_DOMAINS` | empty | Comma-separated domains to reject; subdomains are also rejected |
 
-Create a URL entry, letting the service generate a code:
+The Compose PostgreSQL credentials are `shortener` / `shortener`, database `shortener`. Set `DATABASE_URL=postgres://shortener:shortener@localhost:5432/shortener` in `.env`.
+
+## API
+
+GraphQL remains at `POST /`. `createUrl` accepts absolute HTTP(S) URLs, rejects malformed URLs and domains in `DENIED_DOMAINS`, and accepts an optional custom code. Generated codes are six characters. Codes are 1–10 ASCII letters, numbers, hyphens, or underscores.
 
 ```graphql
 mutation {
@@ -53,32 +42,40 @@ mutation {
 }
 ```
 
-Or provide a custom code:
+`GET /{short_code}` redirects to the destination (temporary redirect). A missing code returns `404`. Redis caches full URL records for five minutes. Set `CACHE_ENABLED=false` and restart the application to bypass Redis.
 
-```graphql
-mutation {
-  createUrl(longUrl: "https://www.rust-lang.org/", customCode: "rust") {
-    id
-    shortCode
-    longUrl
-  }
-}
-```
-
-Look up an entry by its code:
+URL lookup through GraphQL:
 
 ```graphql
 query {
-  getUrl(shortCode: "rust") {
-    id
+  getUrl(shortCode: "abc123") { id shortCode longUrl }
+}
+```
+
+Search Elasticsearch by domain, creation time, or minimum click count:
+
+```graphql
+query {
+  searchUrls(filter: { domain: "rust-lang.org", minClicks: 1 }, limit: 25) {
     shortCode
     longUrl
+    domain
+    createdAt
+    clickCount
   }
 }
 ```
 
-`getUrl` returns `null` when the code does not exist. Short codes must be unique; attempting to create an already-used code returns a database error.
+## Async processing and reliability
 
-## Current scope
+URL creation and its outbox event commit in the same PostgreSQL transaction. A publisher retries unpublished outbox rows until RabbitMQ confirms delivery. The consumer indexes current URL metadata in the Elasticsearch `urls` index. Redirect counts are incremented in PostgreSQL and an outbox event prompts the consumer to refresh the indexed count. Elasticsearch can be rebuilt from PostgreSQL records and is not the source of truth.
 
-This service creates and looks up short URL records. It does not currently provide an HTTP endpoint that redirects a browser from a short code to its destination.
+## Compare redirect latency
+
+Start the service once with `CACHE_ENABLED=true`, then again with `CACHE_ENABLED=false`, and benchmark the same existing code in both modes. Example request loop (replace `abc123` with a real code):
+
+```sh
+python3 scripts/benchmark.py http://localhost:8080/abc123 --requests 10000 --concurrency 50
+```
+
+The script reports p50, p95, p99, and average request latency. Run both modes on the same machine with the same Compose services and request count. Record the environment and measured p99 values here after running; this repository does not claim unmeasured performance numbers.
